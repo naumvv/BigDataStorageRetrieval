@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from datetime import date, datetime
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -884,7 +885,7 @@ def derive_users(
     friends: pd.DataFrame,
     messages: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
-    user_ids = set()
+    series_list: List[pd.Series] = []
 
     for frame, column_names in [
         (events, ["user_id"]),
@@ -896,19 +897,24 @@ def derive_users(
             continue
         for column in column_names:
             if column in frame.columns:
-                values = frame[column].dropna().tolist()
-                for value in values:
-                    try:
-                        user_ids.add(int(value))
-                    except Exception:
-                        pass
+                series_list.append(pd.to_numeric(frame[column], errors="coerce").dropna())
 
-    users = pd.DataFrame({"user_id": sorted(user_ids)})
-    if not users.empty:
-        users["user_id"] = users["user_id"].astype("Int64")
-    else:
-        users["user_id"] = pd.Series([], dtype="Int64")
-    return users
+    if not series_list:
+        return pd.DataFrame({"user_id": pd.Series([], dtype="Int64")})
+
+    all_ids = (
+        pd.concat(series_list, ignore_index=True)
+        .astype("Int64")
+        .drop_duplicates()
+        .dropna()
+        .sort_values()
+        .reset_index(drop=True)
+    )
+    return pd.DataFrame({"user_id": all_ids})
+
+
+def _timed(label: str, t0: float) -> None:
+    print(f"    [{label}]  {time.time() - t0:.1f}s", flush=True)
 
 
 def prepare_frames(
@@ -917,22 +923,48 @@ def prepare_frames(
 ) -> Dict[str, pd.DataFrame]:
     ensure_required_files(data_dir)
 
+    t = time.time()
     events = standardize_events(read_csv_loose(csv_path(data_dir, "events.csv")))
+    _timed(f"events  ({len(events):,} rows)", t)
+
+    t = time.time()
     campaigns = standardize_campaigns(read_csv_loose(csv_path(data_dir, "campaigns.csv")))
+    _timed(f"campaigns  ({len(campaigns):,} rows)", t)
+
+    t = time.time()
     messages = standardize_messages(
         read_csv_loose(csv_path(data_dir, "messages.csv")),
         client_id_prefix=client_id_prefix,
     )
+    _timed(f"messages  ({len(messages):,} rows)", t)
+
+    t = time.time()
     clients = standardize_clients(
         read_csv_loose(csv_path(data_dir, "client_first_purchase_date.csv")),
         messages=messages,
         client_id_prefix=client_id_prefix,
     )
+    _timed(f"clients  ({len(clients):,} rows)", t)
+
+    t = time.time()
     messages = enrich_messages_with_clients(messages, clients)
+    _timed("enrich messages", t)
+
+    t = time.time()
     friends = standardize_friends(read_csv_loose(csv_path(data_dir, "friends.csv")))
+    _timed(f"friends  ({len(friends):,} rows)", t)
+
+    t = time.time()
     campaigns = augment_campaigns_from_messages(campaigns, messages)
+    _timed("augment campaigns", t)
+
+    t = time.time()
     products, categories = derive_products_and_categories(events)
+    _timed(f"products ({len(products):,}) / categories ({len(categories):,})", t)
+
+    t = time.time()
     users = derive_users(events, clients, friends, messages=messages)
+    _timed(f"users  ({len(users):,} rows)", t)
 
     return {
         "events": events,
@@ -977,10 +1009,30 @@ def pythonize(value: Any) -> Any:
 
 
 def records_from_frame(df: pd.DataFrame) -> List[Dict[str, Any]]:
-    records = []
-    for row in df.to_dict(orient="records"):
-        records.append({key: pythonize(value) for key, value in row.items()})
-    return records
+    out = df.copy()
+
+    # Convert datetime columns: valid Timestamps stay as Timestamps (datetime subclass),
+    # NaT → None so pymongo's BSON encoder never sees pd.NaT.
+    for col in out.columns:
+        if pd.api.types.is_datetime64_any_dtype(out[col]):
+            notna = out[col].notna()
+            out[col] = out[col].astype(object).where(notna, None)
+
+    # Convert nullable integer types (Int8/16/32/64) to Python int or None
+    for col in out.select_dtypes(include=["Int8", "Int16", "Int32", "Int64"]).columns:
+        notna = pd.notna(out[col])
+        out[col] = out[col].astype(object).where(notna, None)
+
+    # Convert numpy integer / float scalars to Python native types
+    for col in out.select_dtypes(include=["int8", "int16", "int32", "int64"]).columns:
+        out[col] = out[col].astype(object)
+    for col in out.select_dtypes(include=["float32", "float64"]).columns:
+        out[col] = out[col].where(out[col].notna(), None).astype(object)
+
+    # Replace any remaining pandas NA / NaT / NaN sentinels with None
+    out = out.where(pd.notna(out), None)
+
+    return out.to_dict(orient="records")
 
 
 def write_frame(df: pd.DataFrame, output_path: str) -> None:

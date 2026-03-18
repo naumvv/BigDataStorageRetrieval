@@ -47,24 +47,34 @@ def mongo_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return converted
 
 
+def _progress(label: str, done: int, total: int, elapsed: float) -> None:
+    pct = done / total * 100 if total else 0
+    print(f"  {label}: {done:,}/{total:,}  ({pct:.0f}%)  {elapsed:.1f}s", end="\r", flush=True)
+
+
 def insert_many_batched(collection, docs: List[Dict[str, Any]], label: str) -> None:
     if not docs:
         print(f"  {label}: 0 rows")
         return
+    total = len(docs)
     inserted = 0
-    for offset in range(0, len(docs), BATCH_SIZE):
+    t0 = time.time()
+    for offset in range(0, total, BATCH_SIZE):
         batch = docs[offset : offset + BATCH_SIZE]
         collection.insert_many(batch, ordered=False)
         inserted += len(batch)
-    print(f"  {label}: {inserted:,} rows")
+        _progress(label, inserted, total, time.time() - t0)
+    print(f"  {label}: {inserted:,} rows  ({time.time() - t0:.1f}s)            ")
 
 
 def upsert_many_batched(collection, docs: List[Dict[str, Any]], key_field: str, label: str) -> None:
     if not docs:
         print(f"  {label}: 0 rows")
         return
+    total = len(docs)
     applied = 0
-    for offset in range(0, len(docs), BATCH_SIZE):
+    t0 = time.time()
+    for offset in range(0, total, BATCH_SIZE):
         batch = docs[offset : offset + BATCH_SIZE]
         operations = [
             UpdateOne({key_field: doc[key_field]}, {"$set": doc}, upsert=True)
@@ -72,7 +82,8 @@ def upsert_many_batched(collection, docs: List[Dict[str, Any]], key_field: str, 
         ]
         collection.bulk_write(operations, ordered=False)
         applied += len(batch)
-    print(f"  {label}: {applied:,} rows")
+        _progress(label, applied, total, time.time() - t0)
+    print(f"  {label}: {applied:,} rows  ({time.time() - t0:.1f}s)            ")
 
 
 def build_friend_docs(friend_records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -133,7 +144,10 @@ def main() -> None:
     args = parse_args()
     t0 = time.time()
 
+    print("Reading and preparing CSV frames...")
+    t_prep = time.time()
     frames = prepare_frames(args.data_dir, client_id_prefix=args.client_id_prefix)
+    print(f"  CSV frames ready  ({time.time() - t_prep:.1f}s)")
 
     try:
         client = MongoClient(args.host, args.port)
@@ -146,38 +160,49 @@ def main() -> None:
         client.drop_database(args.dbname)
 
     db = client[args.dbname]
+    fresh = args.drop  # all collections are empty, prefer fast insert_many
 
     print("Loading MongoDB collections...")
 
     user_docs = mongo_records(records_from_frame(frames["users"]))
     for doc in user_docs:
         doc["_id"] = doc["user_id"]
-    upsert_many_batched(db.users, user_docs, "user_id", "users")
+    if fresh:
+        insert_many_batched(db.users, user_docs, "users")
+    else:
+        upsert_many_batched(db.users, user_docs, "user_id", "users")
 
     client_docs = mongo_records(records_from_frame(frames["clients"]))
     for doc in client_docs:
         doc["_id"] = doc["client_id"]
-    upsert_many_batched(db.clients, client_docs, "client_id", "clients")
+    if fresh:
+        insert_many_batched(db.clients, client_docs, "clients")
+    else:
+        upsert_many_batched(db.clients, client_docs, "client_id", "clients")
 
     campaign_docs = mongo_records(records_from_frame(frames["campaigns"]))
     for doc in campaign_docs:
         doc["_id"] = doc["campaign_key"]
-    upsert_many_batched(db.campaigns, campaign_docs, "campaign_key", "campaigns")
+    if fresh:
+        insert_many_batched(db.campaigns, campaign_docs, "campaigns")
+    else:
+        upsert_many_batched(db.campaigns, campaign_docs, "campaign_key", "campaigns")
 
     category_docs = mongo_records(records_from_frame(frames["categories"]))
     for doc in category_docs:
         doc["_id"] = doc["category_id"]
-    upsert_many_batched(db.categories, category_docs, "category_id", "categories")
+    if fresh:
+        insert_many_batched(db.categories, category_docs, "categories")
+    else:
+        upsert_many_batched(db.categories, category_docs, "category_id", "categories")
 
     product_docs = mongo_records(records_from_frame(frames["products"]))
     for doc in product_docs:
         doc["_id"] = doc["product_id"]
-    upsert_many_batched(db.products, product_docs, "product_id", "products")
-
-    if args.drop:
-        db.events.drop()
-        db.friends.drop()
-        db.messages.drop()
+    if fresh:
+        insert_many_batched(db.products, product_docs, "products")
+    else:
+        upsert_many_batched(db.products, product_docs, "product_id", "products")
 
     event_docs = mongo_records(build_event_docs(records_from_frame(frames["events"])))
     insert_many_batched(db.events, event_docs, "events")
@@ -189,7 +214,9 @@ def main() -> None:
     insert_many_batched(db.messages, message_docs, "messages")
 
     print("Creating indexes...")
+    t_idx = time.time()
     create_indexes(db)
+    print(f"  Indexes created  ({time.time() - t_idx:.1f}s)")
 
     print("Collection counts:")
     for collection_name in [

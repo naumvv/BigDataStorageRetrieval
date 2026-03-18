@@ -11,7 +11,7 @@ from neo4j import GraphDatabase
 from common import CLIENT_ID_PREFIX_DEFAULT, prepare_frames, records_from_frame
 
 
-BATCH_SIZE = 5000
+BATCH_SIZE = 500
 
 
 def parse_args() -> argparse.Namespace:
@@ -19,7 +19,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-dir", required=True, help="Directory that contains the raw or cleaned CSV files.")
     parser.add_argument("--uri", default="bolt://localhost:7687")
     parser.add_argument("--username", default="neo4j")
-    parser.add_argument("--password", default="neo4j")
+    parser.add_argument("--password", default="password")
     parser.add_argument("--drop", action="store_true", help="Delete all nodes and relationships before loading.")
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     parser.add_argument(
@@ -35,16 +35,21 @@ def run_batches(session, query: str, rows: List[Dict[str, Any]], label: str, bat
         print(f"  {label}: 0 rows")
         return
 
+    total = len(rows)
     inserted = 0
-    for offset in range(0, len(rows), batch_size):
+    t0 = time.time()
+    for offset in range(0, total, batch_size):
         batch = rows[offset : offset + batch_size]
 
-        def write_chunk(tx):
-            tx.run(query, rows=batch).consume()
+        def write_chunk(tx, b=batch):
+            tx.run(query, rows=b).consume()
 
         session.execute_write(write_chunk)
         inserted += len(batch)
-    print(f"  {label}: {inserted:,} rows")
+        pct = inserted / total * 100
+        elapsed = time.time() - t0
+        print(f"  {label}: {inserted:,}/{total:,}  ({pct:.0f}%)  {elapsed:.1f}s", end="\r", flush=True)
+    print(f"  {label}: {inserted:,} rows  ({time.time() - t0:.1f}s)            ")
 
 
 def create_constraints_and_indexes(session) -> None:
@@ -67,7 +72,11 @@ def create_constraints_and_indexes(session) -> None:
 
 
 def clear_graph(session) -> None:
-    session.run("MATCH (n) DETACH DELETE n").consume()
+    # CALL { } IN TRANSACTIONS splits the delete across many small sub-transactions
+    # so it stays within Neo4j's per-transaction memory limit.
+    session.run(
+        "MATCH (n) CALL { WITH n DETACH DELETE n } IN TRANSACTIONS OF 5000 ROWS"
+    ).consume()
 
 
 def main() -> None:

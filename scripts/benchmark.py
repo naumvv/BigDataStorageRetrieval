@@ -16,7 +16,7 @@ from typing import Dict, List
 
 QUERY_FILES = {
     "psql": ["q1.sql", "q2.sql", "q3.sql"],
-    "mongodb": ["q1.js", "q2.js", "q3.js"],
+    "mongodb": ["q2.js", "q3.js"],
     "graph": ["q1.cypher", "q2.cypher", "q3.cypher"],
 }
 
